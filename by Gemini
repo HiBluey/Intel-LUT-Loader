@@ -1,0 +1,288 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <fstream>
+#include <sstream>
+#include <windows.h>
+
+// =========================================================================
+// 1. 核心定义 (基于验证成功的版本)
+// =========================================================================
+
+#define CTL_APICALL __cdecl
+
+typedef void* ctl_api_handle_t;
+typedef void* ctl_device_adapter_handle_t;
+typedef void* ctl_display_output_handle_t;
+
+typedef enum _ctl_result_t {
+    CTL_RESULT_SUCCESS = 0,
+    CTL_RESULT_ERROR_UNKNOWN = 0x4000FFFF,
+    CTL_RESULT_ERROR_PLATFORM_NOT_SUPPORTED = 0x40000020
+} ctl_result_t;
+
+typedef struct _ctl_application_id_t {
+    uint32_t Data1;
+    uint16_t Data2;
+    uint16_t Data3;
+    uint8_t Data4[8];
+} ctl_application_id_t;
+
+typedef struct _ctl_init_args_t {
+    uint32_t Size;
+    uint8_t Version;
+    uint32_t AppVersion;
+    uint32_t flags;
+    uint32_t SupportedVersion;
+    ctl_application_id_t ApplicationUID;
+} ctl_init_args_t;
+
+// [重要] 必须是 double 类型 [cite: 726-727]
+typedef struct _ctl_pixtx_3dlut_sample_t {
+    double Red;
+    double Green;
+    double Blue;
+} ctl_pixtx_3dlut_sample_t;
+
+// [cite: 728-732]
+typedef struct _ctl_pixtx_3dlut_config_t {
+    uint32_t Size;
+    uint8_t Version;
+    uint32_t NumSamplesPerChannel;
+    ctl_pixtx_3dlut_sample_t* pSampleValues;
+} ctl_pixtx_3dlut_config_t;
+
+typedef union _ctl_pixtx_config_t {
+    ctl_pixtx_3dlut_config_t ThreeDLutConfig;
+} ctl_pixtx_config_t;
+
+typedef enum _ctl_pixtx_block_type_t {
+    CTL_PIXTX_BLOCK_TYPE_3D_LUT = 2,
+} ctl_pixtx_block_type_t;
+
+typedef struct _ctl_pixtx_block_config_t {
+    uint32_t Size;
+    uint8_t Version;
+    uint32_t BlockId;
+    ctl_pixtx_block_type_t BlockType;
+    ctl_pixtx_config_t Config;
+} ctl_pixtx_block_config_t;
+
+typedef enum _ctl_pixtx_config_opertaion_type_t {
+    CTL_PIXTX_CONFIG_OPERTAION_TYPE_SET_CUSTOM = 2,
+} ctl_pixtx_config_opertaion_type_t;
+
+typedef struct _ctl_pixtx_pipe_set_config_t {
+    uint32_t Size;
+    uint8_t Version;
+    ctl_pixtx_config_opertaion_type_t OpertaionType;
+    uint32_t Flags;
+    uint32_t NumBlocks;
+    ctl_pixtx_block_config_t* pBlockConfigs;
+} ctl_pixtx_pipe_set_config_t;
+
+// 函数指针
+typedef ctl_result_t(CTL_APICALL* pfn_ctlInit)(ctl_init_args_t*, ctl_api_handle_t*);
+typedef ctl_result_t(CTL_APICALL* pfn_ctlClose)(ctl_api_handle_t);
+typedef ctl_result_t(CTL_APICALL* pfn_ctlEnumerateDevices)(ctl_api_handle_t, uint32_t*, ctl_device_adapter_handle_t*);
+typedef ctl_result_t(CTL_APICALL* pfn_ctlEnumerateDisplayOutputs)(ctl_device_adapter_handle_t, uint32_t*, ctl_display_output_handle_t*);
+typedef ctl_result_t(CTL_APICALL* pfn_ctlPixelTransformationSetConfig)(ctl_display_output_handle_t, ctl_pixtx_pipe_set_config_t*);
+
+// =========================================================================
+// 2. 辅助函数：解析 .cube 文件
+// =========================================================================
+
+struct LutData {
+    int size;
+    std::vector<ctl_pixtx_3dlut_sample_t> samples;
+};
+
+LutData LoadCubeFile(const std::string& path) {
+    LutData result = { 0 };
+    std::ifstream file(path);
+    if (!file.is_open()) {
+        std::cerr << "【错误】无法打开文件: " << path << std::endl;
+        return result;
+    }
+
+    std::string line;
+    bool foundSize = false;
+
+    std::cout << "正在解析 .cube 文件..." << std::endl;
+
+    while (std::getline(file, line)) {
+        // 跳过空行和注释
+        if (line.empty() || line[0] == '#') continue;
+        // 跳过 TITLE, DOMAIN 等非数据行
+        if (line.rfind("TITLE", 0) == 0 || line.rfind("DOMAIN", 0) == 0) continue;
+
+        // 读取尺寸
+        if (line.rfind("LUT_3D_SIZE", 0) == 0) {
+            std::stringstream ss(line);
+            std::string key;
+            ss >> key >> result.size;
+            foundSize = true;
+            std::cout << ">>>  LUT size detected: " << result.size << "x" << result.size << "x" << result.size << std::endl;
+
+            // 预分配内存，防止大文件卡顿
+            result.samples.reserve(result.size * result.size * result.size);
+            continue;
+        }
+
+        // 读取 RGB 数据 (假设是纯数字行)
+        if (foundSize) {
+            // 简单的判断：如果是数字开头
+            if (isdigit(line[0]) || line[0] == '-' || line[0] == '.') {
+                double r, g, b;
+                std::stringstream ss(line);
+                if (ss >> r >> g >> b) {
+                    ctl_pixtx_3dlut_sample_t sample;
+                    sample.Red = r;
+                    sample.Green = g;
+                    sample.Blue = b;
+                    result.samples.push_back(sample);
+                }
+            }
+        }
+    }
+
+    // 校验
+    size_t expected = result.size * result.size * result.size;
+    if (result.samples.size() != expected) {
+        std::cerr << "【warning】data point mismatch！expect: " << expected << ", actual: " << result.samples.size() << std::endl;
+        // 如果数据不够，可能文件损坏，或者解析逻辑对于该特定cube文件不完美
+        // 但我们可以尝试继续，或者返回错误
+        if (result.samples.empty()) result.size = 0;
+    }
+
+    return result;
+}
+
+// =========================================================================
+// 3. 主程序
+// =========================================================================
+
+int main() {
+    // 设置控制台编码，防止乱码
+    SetConsoleOutputCP(CP_UTF8);
+
+    // 1. 加载库 (System32 里的那个)
+    const char* dllPath = "C:\\Windows\\System32\\ControlLib.dll";
+    HMODULE hDll = LoadLibraryA(dllPath);
+    if (!hDll) {
+        std::cerr << "Can not load System32\\ControlLib.dll" << std::endl;
+        system("pause");
+        return -1;
+    }
+
+    // 2. 获取函数
+    auto ctlInit = (pfn_ctlInit)GetProcAddress(hDll, "ctlInit");
+    auto ctlClose = (pfn_ctlClose)GetProcAddress(hDll, "ctlClose");
+    auto ctlEnumerateDevices = (pfn_ctlEnumerateDevices)GetProcAddress(hDll, "ctlEnumerateDevices");
+    auto ctlEnumerateDisplayOutputs = (pfn_ctlEnumerateDisplayOutputs)GetProcAddress(hDll, "ctlEnumerateDisplayOutputs");
+    auto ctlPixelTransformationSetConfig = (pfn_ctlPixelTransformationSetConfig)GetProcAddress(hDll, "ctlPixelTransformationSetConfig");
+
+    if (!ctlInit || !ctlPixelTransformationSetConfig) {
+        std::cerr << "DLL missing function。" << std::endl;
+        return -1;
+    }
+
+    // 3. 初始化 (Version 1.1)
+    ctl_api_handle_t hAPI = nullptr;
+    ctl_init_args_t initArgs = { 0 };
+    initArgs.Size = sizeof(ctl_init_args_t);
+    initArgs.Version = 0;
+    initArgs.AppVersion = (1 << 16);
+    initArgs.SupportedVersion = 0;
+    ZeroMemory(&initArgs.ApplicationUID, sizeof(ctl_application_id_t));
+
+    if (ctlInit(&initArgs, &hAPI) != CTL_RESULT_SUCCESS) {
+        std::cerr << "Initialization fail。请确认是否在'图形设置'中将本程序指定为'节能(Intel)'模式。" << std::endl;
+        system("pause");
+        return -1;
+    }
+
+    // 4. 获取显示器
+    uint32_t adapterCount = 0;
+    ctlEnumerateDevices(hAPI, &adapterCount, nullptr);
+    if (adapterCount == 0) return -1;
+
+    std::vector<ctl_device_adapter_handle_t> adapters(adapterCount);
+    ctlEnumerateDevices(hAPI, &adapterCount, adapters.data());
+
+    ctl_display_output_handle_t hDisplay = nullptr;
+    uint32_t displayCount = 0;
+    ctlEnumerateDisplayOutputs(adapters[0], &displayCount, nullptr);
+    if (displayCount > 0) {
+        std::vector<ctl_display_output_handle_t> displays(displayCount);
+        ctlEnumerateDisplayOutputs(adapters[0], &displayCount, displays.data());
+        hDisplay = displays[0];
+    }
+    else {
+        std::cerr << "No device found。" << std::endl;
+        ctlClose(hAPI);
+        system("pause");
+        return -1;
+    }
+
+    // 5. 用户输入文件
+    std::cout << "\n=============================================" << std::endl;
+    std::cout << "   Intel 显卡 3D LUT 加载器 (支持 .cube)" << std::endl;
+    std::cout << "=============================================" << std::endl;
+    std::cout << "Drag the .cube file in，and press ENTER: ";
+
+    std::string filePath;
+    std::getline(std::cin, filePath);
+
+    // 清理拖拽产生的双引号
+    if (!filePath.empty() && filePath.front() == '"' && filePath.back() == '"') {
+        filePath = filePath.substr(1, filePath.length() - 2);
+    }
+
+    // 6. 解析文件
+    LutData lut = LoadCubeFile(filePath);
+    if (lut.size == 0) {
+        std::cerr << "Read failure,format error。" << std::endl;
+        ctlClose(hAPI);
+        system("pause");
+        return -1;
+    }
+
+    // 7. 应用 LUT
+    ctl_pixtx_3dlut_config_t lutConfig = { 0 };
+    lutConfig.Size = sizeof(ctl_pixtx_3dlut_config_t);
+    lutConfig.Version = 0;
+    lutConfig.NumSamplesPerChannel = lut.size; // 自动使用文件中的尺寸 (17, 33, 65)
+    lutConfig.pSampleValues = lut.samples.data();
+
+    ctl_pixtx_block_config_t blockConfig = { 0 };
+    blockConfig.Size = sizeof(ctl_pixtx_block_config_t);
+    blockConfig.Version = 0;
+    blockConfig.BlockId = 2;
+    blockConfig.BlockType = CTL_PIXTX_BLOCK_TYPE_3D_LUT;
+    blockConfig.Config.ThreeDLutConfig = lutConfig;
+
+    ctl_pixtx_pipe_set_config_t pipeConfig = { 0 };
+    pipeConfig.Size = sizeof(ctl_pixtx_pipe_set_config_t);
+    pipeConfig.Version = 0;
+    pipeConfig.OpertaionType = CTL_PIXTX_CONFIG_OPERTAION_TYPE_SET_CUSTOM;
+    pipeConfig.NumBlocks = 1;
+    pipeConfig.pBlockConfigs = &blockConfig;
+
+    std::cout << "Uploading LUT (" << lut.size << "点精度)..." << std::endl;
+    ctl_result_t res = ctlPixelTransformationSetConfig(hDisplay, &pipeConfig);
+
+    if (res == CTL_RESULT_SUCCESS) {
+        std::cout << "\n【successed！】LUT Appiled。" << std::endl;
+    }
+    else {
+        std::cout << "\n【失败】错误代码: 0x" << std::hex << res << std::dec << std::endl;
+        if (res == 0x4000000b) {
+            std::cout << "提示：Invalid Argument。如果你的 LUT 是 64点或其他非标尺寸，请转换为 17/33/65 再试。" << std::endl;
+        }
+    }
+
+    ctlClose(hAPI);
+    system("pause");
+    return 0;
+}
