@@ -4,9 +4,10 @@
 #include <fstream>
 #include <sstream>
 #include <windows.h>
+#include <locale.h> // 引入 locale 头文件
 
 // =========================================================================
-// 1. 核心定义 (基于验证成功的版本)
+// 1. 核心定义 (保持不变)
 // =========================================================================
 
 #define CTL_APICALL __cdecl
@@ -37,14 +38,13 @@ typedef struct _ctl_init_args_t {
     ctl_application_id_t ApplicationUID;
 } ctl_init_args_t;
 
-// [重要] 必须是 double 类型 [cite: 726-727]
+// [重要] 必须是 double 类型
 typedef struct _ctl_pixtx_3dlut_sample_t {
     double Red;
     double Green;
     double Blue;
 } ctl_pixtx_3dlut_sample_t;
 
-// [cite: 728-732]
 typedef struct _ctl_pixtx_3dlut_config_t {
     uint32_t Size;
     uint8_t Version;
@@ -109,13 +109,11 @@ LutData LoadCubeFile(const std::string& path) {
     bool foundSize = false;
 
     std::cout << "正在解析 .cube 文件..." << std::endl;
-
     while (std::getline(file, line)) {
         // 跳过空行和注释
         if (line.empty() || line[0] == '#') continue;
         // 跳过 TITLE, DOMAIN 等非数据行
         if (line.rfind("TITLE", 0) == 0 || line.rfind("DOMAIN", 0) == 0) continue;
-
         // 读取尺寸
         if (line.rfind("LUT_3D_SIZE", 0) == 0) {
             std::stringstream ss(line);
@@ -123,7 +121,6 @@ LutData LoadCubeFile(const std::string& path) {
             ss >> key >> result.size;
             foundSize = true;
             std::cout << ">>>  LUT size detected: " << result.size << "x" << result.size << "x" << result.size << std::endl;
-
             // 预分配内存，防止大文件卡顿
             result.samples.reserve(result.size * result.size * result.size);
             continue;
@@ -149,7 +146,7 @@ LutData LoadCubeFile(const std::string& path) {
     // 校验
     size_t expected = result.size * result.size * result.size;
     if (result.samples.size() != expected) {
-        std::cerr << "【warning】data point mismatch！expect: " << expected << ", actual: " << result.samples.size() << std::endl;
+        std::cerr << "【警告】数据点不匹配！期望: " << expected << ", 实际: " << result.samples.size() << std::endl;
         // 如果数据不够，可能文件损坏，或者解析逻辑对于该特定cube文件不完美
         // 但我们可以尝试继续，或者返回错误
         if (result.samples.empty()) result.size = 0;
@@ -163,8 +160,10 @@ LutData LoadCubeFile(const std::string& path) {
 // =========================================================================
 
 int main() {
-    // 设置控制台编码，防止乱码
-    SetConsoleOutputCP(CP_UTF8);
+    // 设置本地化环境，让控制台正确处理本地字符集（GBK等），防止中文乱码
+    setlocale(LC_ALL, ""); 
+    
+    // 移除 SetConsoleOutputCP(CP_UTF8)，避免与系统默认编码冲突导致乱码
 
     // 1. 加载库 (System32 里的那个)
     const char* dllPath = "C:\\Windows\\System32\\ControlLib.dll";
@@ -181,9 +180,8 @@ int main() {
     auto ctlEnumerateDevices = (pfn_ctlEnumerateDevices)GetProcAddress(hDll, "ctlEnumerateDevices");
     auto ctlEnumerateDisplayOutputs = (pfn_ctlEnumerateDisplayOutputs)GetProcAddress(hDll, "ctlEnumerateDisplayOutputs");
     auto ctlPixelTransformationSetConfig = (pfn_ctlPixelTransformationSetConfig)GetProcAddress(hDll, "ctlPixelTransformationSetConfig");
-
     if (!ctlInit || !ctlPixelTransformationSetConfig) {
-        std::cerr << "DLL missing function。" << std::endl;
+        std::cerr << "DLL missing function." << std::endl;
         return -1;
     }
 
@@ -197,7 +195,7 @@ int main() {
     ZeroMemory(&initArgs.ApplicationUID, sizeof(ctl_application_id_t));
 
     if (ctlInit(&initArgs, &hAPI) != CTL_RESULT_SUCCESS) {
-        std::cerr << "Initialization fail。请确认是否在'图形设置'中将本程序指定为'节能(Intel)'模式。" << std::endl;
+        std::cerr << "Initialization failed. 请确认是否在'图形设置'中将本程序指定为'节能(Intel)'模式。" << std::endl;
         system("pause");
         return -1;
     }
@@ -219,7 +217,7 @@ int main() {
         hDisplay = displays[0];
     }
     else {
-        std::cerr << "No device found。" << std::endl;
+        std::cerr << "No device found." << std::endl;
         ctlClose(hAPI);
         system("pause");
         return -1;
@@ -229,11 +227,10 @@ int main() {
     std::cout << "\n=============================================" << std::endl;
     std::cout << "   Intel 显卡 3D LUT 加载器 (支持 .cube)" << std::endl;
     std::cout << "=============================================" << std::endl;
-    std::cout << "Drag the .cube file in，and press ENTER: ";
+    std::cout << "Drag the .cube file in, and press ENTER: ";
 
     std::string filePath;
     std::getline(std::cin, filePath);
-
     // 清理拖拽产生的双引号
     if (!filePath.empty() && filePath.front() == '"' && filePath.back() == '"') {
         filePath = filePath.substr(1, filePath.length() - 2);
@@ -242,7 +239,7 @@ int main() {
     // 6. 解析文件
     LutData lut = LoadCubeFile(filePath);
     if (lut.size == 0) {
-        std::cerr << "Read failure,format error。" << std::endl;
+        std::cerr << "Read failure, format error." << std::endl;
         ctlClose(hAPI);
         system("pause");
         return -1;
@@ -254,7 +251,6 @@ int main() {
     lutConfig.Version = 0;
     lutConfig.NumSamplesPerChannel = lut.size; // 自动使用文件中的尺寸 (17, 33, 65)
     lutConfig.pSampleValues = lut.samples.data();
-
     ctl_pixtx_block_config_t blockConfig = { 0 };
     blockConfig.Size = sizeof(ctl_pixtx_block_config_t);
     blockConfig.Version = 0;
@@ -273,7 +269,7 @@ int main() {
     ctl_result_t res = ctlPixelTransformationSetConfig(hDisplay, &pipeConfig);
 
     if (res == CTL_RESULT_SUCCESS) {
-        std::cout << "\n【successed！】LUT Appiled。" << std::endl;
+        std::cout << "\n【Success】LUT Applied." << std::endl;
     }
     else {
         std::cout << "\n【失败】错误代码: 0x" << std::hex << res << std::dec << std::endl;
